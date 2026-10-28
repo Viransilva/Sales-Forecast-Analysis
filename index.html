@@ -1058,7 +1058,8 @@ html[data-theme="dark"] .nav{background:linear-gradient(180deg,#0a1a30 0%,color-
       <div class="s-hd"><h2>Multi-season plan</h2><span class="sub">Set a separate target for each season and build them together</span><div class="sp"></div>
         <button class="btn" id="pmAdd">&#65291; Add season</button>
         <button class="btn primary" id="pmBuild">&#9881; Build all</button>
-        <button class="btn gpos" id="pmExport">&#8659; Export all</button></div>
+        <button class="btn gpos" id="pmExport">&#8659; Export all</button>
+        <button class="btn" id="pmCloud" title="Save this multi-season plan to the cloud">&#9729; Save plan</button></div>
       <div class="tbl-wrap"><table id="pmTbl"><thead><tr>
         <th style="width:150px">Target season</th><th style="width:170px">Reference season</th><th style="width:190px">Target FOB</th>
         <th>Existing FOB</th><th>Placeholder Qty</th><th>Placeholder FOB</th><th>Avg FOB/u</th><th>Styles</th><th style="width:44px"></th></tr></thead>
@@ -2985,6 +2986,40 @@ function sbSetStatus(msg,err){ const el=document.getElementById('cloudStatus'); 
 function isNetworkDown(e){ const m=(e&&e.message||'').toLowerCase(); return m.includes('failed to fetch')||m.includes('networkerror')||m.includes('load failed')||m.includes('fetch'); }
 function cloudUnavailable(where){ footStatus('Cloud sync unavailable — snapshots need an internet connection', 'warn'); sbSetStatus('Offline — cloud save/load paused'); }
 
+
+// ---- line-level rows ↔ Supabase forecast_rows (enables New/Repeat, planning & SQL views after load) ----
+const APP_VERSION='sfi-2.0';
+function sbRowsFor(ds, snapshotId){
+  const recs=RAW[ds]||[], rw=RAW.raw&&RAW.raw[ds], c=rw?rawColIdx(ds):null;
+  const D=(r,d)=>{ const v=RAW.dict[d][r[IDX[d]]]; return (v==null||v==='')?null:String(v); };
+  return recs.map((r,i)=>{ const raw=rw?rw.rows[i]:null;
+    return { snapshot_id:snapshotId, dataset:ds, row_idx:i,
+      bu:D(r,'BU'), division:D(r,'Division'), customer:D(r,'Customer'), factory:D(r,'Factory'), season:D(r,'Season'),
+      order_status:D(r,'Order Status'), forecast_ref:D(r,'Forecast or Buy Reference'), development_type:D(r,'Development Type'),
+      new_repeat_file:D(r,'New / Repeat'), product_category:D(r,'Product Category'), fy:D(r,'FY'), qtr:D(r,'Qtr'), yy_mm:D(r,'YY-MM'),
+      style_no:(raw&&c&&c['Style No']!=null&&raw[c['Style No']]!=null)?String(raw[c['Style No']]).trim():null,
+      description:(raw&&c&&c['Description']!=null&&raw[c['Description']]!=null)?String(raw[c['Description']]):null,
+      qty:+r[QI]||0, total_fob:+r[FI]||0, total_sah:+r[SI]||0, total_earning:+(r[EI]||0), raw:raw||null }; });
+}
+async function sbInsertRows(rows,onProg){
+  const B=500;
+  for(let i=0;i<rows.length;i+=B){
+    const res=await fetch(`${SUPABASE_URL}/rest/v1/forecast_rows`,{method:'POST',headers:{...sbHeaders,'Prefer':'return=minimal'},body:JSON.stringify(rows.slice(i,i+B))});
+    if(!res.ok) throw new Error('rows '+res.status);
+    if(onProg) onProg(Math.min(i+B,rows.length),rows.length);
+  }
+}
+async function sbFetchRaw(snapshotId){
+  const out={prev:[],curr:[],budget:[]}, B=1000;
+  for(let off=0;;off+=B){
+    const res=await fetch(`${SUPABASE_URL}/rest/v1/forecast_rows?snapshot_id=eq.${snapshotId}&select=dataset,row_idx,raw&order=dataset.asc,row_idx.asc&limit=${B}&offset=${off}`,{headers:sbHeaders});
+    if(!res.ok) throw new Error('rows '+res.status);
+    const L=await res.json(); L.forEach(r=>{ if(out[r.dataset]) out[r.dataset][r.row_idx]=r.raw; });
+    footStatus(`Loading line-level rows… ${off+L.length}`,'busy');
+    if(L.length<B) break;
+  }
+  return out;
+}
 async function snapSave(){
   if(!hasData()){ footStatus('Load data before saving a snapshot','warn'); return; }
   const name=(document.getElementById('snapName').value||'').trim();
@@ -2992,13 +3027,29 @@ async function snapSave(){
   const note=(document.getElementById('snapNote').value||'').trim();
   const payload={ dims:RAW.dims, meas:RAW.meas, dict:RAW.dict, labels:RAW.labels,
                   prev:RAW.prev, curr:RAW.curr, budget:RAW.budget||[] };
+  const hasRaw=!!(RAW.raw&&(RAW.raw.prev||RAW.raw.curr));
+  const fyDi=IDX['FY'];
   const body={ name, note, label_prev:RAW.labels.prev, label_curr:RAW.labels.curr,
-               label_budget:RAW.labels.budget||null, payload };
+               label_budget:RAW.labels.budget||null, payload, app_version:APP_VERSION, has_raw:hasRaw,
+               raw_headers:{prev:RAW.raw&&RAW.raw.prev?RAW.raw.prev.header:null, curr:RAW.raw&&RAW.raw.curr?RAW.raw.curr.header:null, budget:RAW.raw&&RAW.raw.budget?RAW.raw.budget.header:null},
+               budget_fys:[...new Set((RAW.budget||[]).map(r=>RAW.dict['FY'][r[fyDi]]))].sort(),
+               row_counts:{prev:(RAW.prev||[]).length, curr:(RAW.curr||[]).length, budget:(RAW.budget||[]).length} };
   footStatus('Saving snapshot…','busy'); sbSetStatus('Saving…');
   try{
-    const res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}`,{ method:'POST', headers:{...sbHeaders,'Prefer':'return=minimal'}, body:JSON.stringify(body) });
+    let res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}`,{ method:'POST', headers:{...sbHeaders,'Prefer':'return=representation'}, body:JSON.stringify(body) });
+    if(!res.ok && res.status===400){ // database still on v1 schema → save the basic snapshot and say how to upgrade
+      const {app_version,has_raw,raw_headers,budget_fys,row_counts,...basic}=body;
+      res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}`,{ method:'POST', headers:{...sbHeaders,'Prefer':'return=representation'}, body:JSON.stringify(basic) });
+      if(res.ok){ footStatus('Snapshot saved (basic) — run supabase_setup_v2.sql to also store style-level rows','warn'); sbSetStatus('Saved'); snapList(); return; }
+    }
     if(!res.ok){ footStatus('Save failed ('+res.status+') — check the snapshots table / RLS','warn'); sbSetStatus('Save failed'); return; }
-    footStatus('Snapshot “'+name+'” saved','ok'); sbSetStatus('Saved '+new Date().toLocaleTimeString());
+    const saved=(await res.json())[0]||{};
+    if(hasRaw && saved.id){
+      try{ const all=[...sbRowsFor('prev',saved.id),...sbRowsFor('curr',saved.id),...sbRowsFor('budget',saved.id)];
+        await sbInsertRows(all,(n,t)=>footStatus(`Saving line-level rows… ${fmtNum(n)} / ${fmtNum(t)}`,'busy'));
+      }catch(e){ footStatus('Snapshot saved, but line-level rows failed — run supabase_setup_v2.sql','warn'); sbSetStatus('Saved (no rows)'); snapList(); return; }
+    }
+    footStatus('Snapshot “'+name+'” saved'+(hasRaw?' with line-level rows':''),'ok'); sbSetStatus('Saved '+new Date().toLocaleTimeString());
     document.getElementById('snapName').value=''; document.getElementById('snapNote').value='';
     snapList();
   }catch(e){ if(isNetworkDown(e)) cloudUnavailable('save'); else { footStatus('Could not save snapshot','warn'); sbSetStatus('Save failed'); } }
@@ -3033,12 +3084,20 @@ async function snapList(){
 async function snapLoad(id){
   footStatus('Loading snapshot…','busy'); sbSetStatus('Loading…');
   try{
-    const res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?id=eq.${id}&select=name,payload`,{ headers:sbHeaders });
+    let res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?id=eq.${id}&select=name,payload,has_raw,raw_headers`,{ headers:sbHeaders });
+    if(!res.ok && res.status===400) res=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?id=eq.${id}&select=name,payload`,{ headers:sbHeaders });
     if(!res.ok){ footStatus('Could not load snapshot ('+res.status+')','warn'); return; }
     const rows=await res.json(); if(!rows.length){ footStatus('Snapshot not found','warn'); return; }
     const p=rows[0].payload;
     // restore into RAW
     RAW.dict=p.dict; RAW.labels=p.labels||RAW.labels; RAW.prev=p.prev||[]; RAW.curr=p.curr||[]; RAW.budget=p.budget||[];
+    RAW.raw={};
+    if(rows[0].has_raw && rows[0].raw_headers){   // restore line-level rows → New/Repeat, planning, full-format export
+      try{ const R=await sbFetchRaw(id); const H=rows[0].raw_headers;
+        ['prev','curr','budget'].forEach(ds=>{ if(H[ds] && R[ds].length===(RAW[ds]||[]).length) RAW.raw[ds]={header:H[ds],rows:R[ds]}; });
+      }catch(e){ footStatus('Snapshot loaded without line-level rows','warn'); }
+    }
+    _nrCache=null;
     RAW.stamp='Loaded snapshot “'+rows[0].name+'” · '+new Date().toLocaleString();
     SLICER_DIMS.forEach(d=>STATE.filters[d]=new Set()); _filterSig=null; refreshMonths();
     refreshLabels(); buildSlicers(); buildSegs(); renderDataPanels();
@@ -3327,6 +3386,18 @@ document.getElementById('planExport').onclick=()=>exportPlanning();
 document.getElementById('planSave').onclick=savePlanScenario;
 document.getElementById('pmAdd').onclick=()=>{ STATE.planMultiRows.push(pmSuggest()); renderPlanMulti(); };
 document.getElementById('pmBuild').onclick=buildPlanMulti;
+document.getElementById('pmCloud').onclick=async()=>{
+  const L=STATE.planMulti||[]; if(!L.length){ footStatus('Build all first','warn'); return; }
+  const name=(prompt('Plan name:',`Plan ${L.map(R=>R.tname).join(' + ')}`)||'').trim(); if(!name) return;
+  const M=STATE.planMeta||{};
+  try{ footStatus('Saving plan…','busy');
+    const r=await fetch(`${SUPABASE_URL}/rest/v1/plan_multi_runs`,{method:'POST',headers:{...sbHeaders,'Prefer':'return=representation'},body:JSON.stringify({name,dataset:L[0].ds,mode:M.mode||'add',adjustment:M.adj||0})});
+    if(!r.ok) throw new Error(r.status); const run=(await r.json())[0];
+    const rows=L.map((R,i)=>({run_id:run.id,sort_order:i,target_season:R.tname,reference_season:R.ref,target_fob:(R.__meta&&R.__meta.entered)||R.target,
+      existing_fob:R.__meta?R.__meta.existing:0,placeholder_fob:R.totPhF,placeholder_qty:R.totPhQ,styles_in_plan:R.styleCount||null}));
+    const r2=await fetch(`${SUPABASE_URL}/rest/v1/plan_multi_rows`,{method:'POST',headers:{...sbHeaders,'Prefer':'return=minimal'},body:JSON.stringify(rows)});
+    if(!r2.ok) throw new Error(r2.status); footStatus(`Plan “${name}” saved to cloud`,'ok');
+  }catch(e){ if(isNetworkDown(e)) cloudUnavailable('save'); else footStatus('Could not save plan — run supabase_setup_v2.sql','warn'); } };
 document.querySelectorAll('#ovInsTab button').forEach(b=>b.onclick=()=>{ const t=b.dataset.t;
   document.querySelectorAll('#ovInsTab button').forEach(x=>x.classList.toggle('on',x===b));
   document.getElementById('ovInsAtt').style.display=t==='att'?'':'none'; document.getElementById('ovInsChg').style.display=t==='chg'?'':'none';
@@ -4397,6 +4468,11 @@ function savePlanScenario(){
     existing:M.existing||0, phF:R.totPhF, phQ:R.totPhQ, styles:R.styleCount||null, excl:[...(STATE.planExcluded||[])],
     grain:STATE.planGrain, when:new Date().toLocaleTimeString() });
   renderPlanScenarios(); footStatus(`Scenario “${name}” saved`,'ok');
+  const s=STATE.planScenarios[STATE.planScenarios.length-1];
+  fetch(`${SUPABASE_URL}/rest/v1/plan_scenarios`,{method:'POST',headers:{...sbHeaders,'Prefer':'return=minimal'},body:JSON.stringify({
+    name:s.name, dataset:s.ds, reference_season:s.ref, target_season:s.tname, mode:s.mode, adjustment:s.adj||0, entered_target:s.entered,
+    existing_fob:s.existing||0, placeholder_fob:s.phF, placeholder_qty:s.phQ, styles_in_plan:s.styles, excluded_styles:s.excl||[], grain:s.grain })})
+    .then(r=>{ if(r.ok) footStatus(`Scenario “${name}” saved (also in cloud)`,'ok'); }).catch(()=>{});
 }
 function renderPlanScenarios(){
   const sec=document.getElementById('planScnSec'); if(!sec) return;
